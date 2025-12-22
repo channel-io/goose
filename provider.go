@@ -95,6 +95,7 @@ func NewProvider(dialect Dialect, db *sql.DB, fsys fs.FS, opts ...ProviderOption
 		if err != nil {
 			return nil, err
 		}
+		cfg.dialect = dialect
 	} else {
 		store = cfg.store
 	}

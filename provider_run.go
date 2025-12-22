@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/pressly/goose/v3/database"
@@ -530,6 +531,110 @@ func (p *Provider) runSQL(ctx context.Context, db database.DBTxConn, m *Migratio
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
+		// For StarRocks, wait for async ALTER TABLE operations to complete
+		if p.cfg.dialect == database.DialectStarrocks {
+			if err := p.pollStarRocksAlterComplete(ctx, db, stmt); err != nil {
+				return fmt.Errorf("failed to poll starrocks alter table: %w", err)
+			}
+		}
 	}
 	return nil
+}
+
+func (p *Provider) pollStarRocksAlterComplete(
+	ctx context.Context,
+	db database.DBTxConn,
+	query string,
+) error {
+	normalized := strings.ToUpper(strings.TrimSpace(query))
+	if !strings.HasPrefix(normalized, "ALTER TABLE") {
+		return nil
+	}
+
+	timeout := time.After(10 * time.Minute)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for ALTER TABLE to complete")
+		case <-ticker.C:
+			done, err := p.isStarRocksAlterComplete(ctx, db)
+			if err != nil {
+				p.logf(ctx,
+					fmt.Sprintf("error checking alter status: %v", err),
+					"error checking alter status",
+					slog.String("error", err.Error()),
+				)
+				continue
+			}
+			if done {
+				return nil
+			}
+		}
+	}
+}
+
+func (p *Provider) isStarRocksAlterComplete(ctx context.Context, db database.DBTxConn) (bool, error) {
+	alterTypes := []string{"COLUMN", "ROLLUP"}
+
+	for _, alterType := range alterTypes {
+		query := fmt.Sprintf("SHOW ALTER TABLE %s", alterType)
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			continue // Some StarRocks versions may not support all alter types
+		}
+
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return false, err
+		}
+
+		stateIdx := -1
+		for i, col := range cols {
+			if strings.EqualFold(col, "State") {
+				stateIdx = i
+				break
+			}
+		}
+
+		for rows.Next() {
+			values := make([]interface{}, len(cols))
+			valuePtrs := make([]interface{}, len(cols))
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				rows.Close()
+				return false, err
+			}
+
+			if stateIdx >= 0 {
+				var state string
+				switch v := values[stateIdx].(type) {
+				case []byte:
+					state = string(v)
+				case string:
+					state = v
+				}
+				if state != "FINISHED" && state != "CANCELLED" {
+					rows.Close()
+					return false, nil
+				}
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("error iterating alter status rows: %w", err)
+		}
+		rows.Close()
+	}
+
+	return true, nil
 }

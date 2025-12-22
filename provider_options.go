@@ -247,6 +247,7 @@ func WithIsolateDDL(b bool) ProviderOption {
 type config struct {
 	tableName string
 	store     database.Store
+	dialect   database.Dialect
 
 	verbose         bool
 	excludePaths    map[string]bool

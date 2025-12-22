@@ -225,6 +225,10 @@ func (m *Migration) run(ctx context.Context, db *sql.DB, direction bool) error {
 			return fmt.Errorf("ERROR %v: failed to parse SQL migration file: %w", filepath.Base(m.Source), err)
 		}
 
+		if GetDialect() == DialectStarrocks {
+			useTx = false
+		}
+
 		start := time.Now()
 		if err := runSQLMigration(ctx, db, statements, useTx, m.Version, direction, m.noVersioning); err != nil {
 			return fmt.Errorf("ERROR %v: failed to run SQL migration: %w", filepath.Base(m.Source), err)

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strings"
+	"time"
 )
 
 // Run a migration specified in raw SQL.
@@ -41,6 +43,13 @@ func runSQLMigration(
 				_ = tx.Rollback()
 				return fmt.Errorf("failed to execute SQL query %q: %w", clearStatement(query), err)
 			}
+			if GetDialect() == DialectStarrocks {
+				if err := pollStarRocksAlterTable(ctx, tx, query); err != nil {
+					verboseInfo("Rollback transaction")
+					_ = tx.Rollback()
+					return fmt.Errorf("failed to poll starrocks alter table: %w", err)
+				}
+			}
 		}
 
 		if !noVersioning {
@@ -72,6 +81,11 @@ func runSQLMigration(
 		verboseInfo("Executing statement: %s", clearStatement(query))
 		if _, err := db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("failed to execute SQL query %q: %w", clearStatement(query), err)
+		}
+		if GetDialect() == DialectStarrocks {
+			if err := pollStarRocksAlterTable(ctx, db, query); err != nil {
+				return fmt.Errorf("failed to poll starrocks alter table: %w", err)
+			}
 		}
 	}
 	if !noVersioning {
@@ -112,4 +126,101 @@ var (
 func clearStatement(s string) string {
 	s = matchSQLComments.ReplaceAllString(s, ``)
 	return matchEmptyEOL.ReplaceAllString(s, ``)
+}
+
+func pollStarRocksAlterTable(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, _ string) error {
+
+	timeout := time.After(10 * time.Minute)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for StarRocks ALTER to finish")
+		case <-ticker.C:
+			done, err := isStarRocksAlterComplete(ctx, db)
+			if err != nil {
+				verboseInfo("error checking alter status: %v", err)
+				continue
+			}
+			if done {
+				return nil
+			}
+		}
+	}
+}
+
+func isStarRocksAlterComplete(ctx context.Context, db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (bool, error) {
+	alterTypes := []string{"COLUMN", "ROLLUP"}
+
+	for _, alterType := range alterTypes {
+		q := fmt.Sprintf("SHOW ALTER TABLE %s", alterType)
+		rows, err := db.QueryContext(ctx, q)
+		if err != nil {
+			continue // Some StarRocks versions may not support all alter types
+		}
+
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return false, err
+		}
+
+		stateIdx := -1
+		for i, col := range cols {
+			if strings.EqualFold(col, "State") {
+				stateIdx = i
+				break
+			}
+		}
+
+		if stateIdx == -1 {
+			rows.Close()
+			continue
+		}
+
+		for rows.Next() {
+			values := make([]interface{}, len(cols))
+			valuePtrs := make([]interface{}, len(cols))
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				rows.Close()
+				return false, err
+			}
+
+			stateStr := ""
+			if stateIdx >= 0 {
+				switch v := values[stateIdx].(type) {
+				case []byte:
+					stateStr = string(v)
+				case string:
+					stateStr = v
+				}
+			}
+
+			if stateStr != "" && stateStr != "FINISHED" && stateStr != "CANCELLED" {
+				verboseInfo("StarRocks %s alter still in progress: %s", alterType, stateStr)
+				rows.Close()
+				return false, nil
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("error iterating alter status rows: %w", err)
+		}
+		rows.Close()
+	}
+
+	return true, nil
 }

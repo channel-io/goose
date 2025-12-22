@@ -268,6 +268,7 @@ Drivers:
     clickhouse
     ydb
     turso
+    starrocks
 
 Examples:
     goose sqlite3 ./foo.db status

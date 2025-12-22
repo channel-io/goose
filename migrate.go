@@ -253,6 +253,9 @@ func EnsureDBVersionContext(ctx context.Context, db *sql.DB) (int64, error) {
 // createVersionTable creates the db version table and inserts the
 // initial 0 value into it.
 func createVersionTable(ctx context.Context, db *sql.DB) error {
+	if GetDialect() == DialectStarrocks {
+		return createVersionTableNoTx(ctx, db)
+	}
 	txn, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -266,6 +269,13 @@ func createVersionTable(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return txn.Commit()
+}
+
+func createVersionTableNoTx(ctx context.Context, db *sql.DB) error {
+	if err := store.CreateVersionTableNoTx(ctx, db, TableName()); err != nil {
+		return err
+	}
+	return store.InsertVersionNoTx(ctx, db, TableName(), 0)
 }
 
 // GetDBVersion is an alias for EnsureDBVersion, but returns -1 in error.

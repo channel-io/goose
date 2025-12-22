@@ -35,7 +35,15 @@ func init() {
 	store, _ = legacystore.NewStore(DialectPostgres)
 }
 
-var store legacystore.Store
+var (
+	store          legacystore.Store
+	currentDialect Dialect = DialectPostgres
+)
+
+// GetDialect returns the current dialect.
+func GetDialect() Dialect {
+	return currentDialect
+}
 
 // SetDialect sets the dialect to use for the goose package.
 func SetDialect(s string) error {
@@ -69,6 +77,7 @@ func SetDialect(s string) error {
 		return fmt.Errorf("%q: unknown dialect", s)
 	}
 	var err error
+	currentDialect = d
 	store, err = legacystore.NewStore(d)
 	return err
 }
